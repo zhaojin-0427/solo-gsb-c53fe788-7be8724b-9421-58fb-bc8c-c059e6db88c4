@@ -1,0 +1,49 @@
+services:
+  vector-tiles:
+    build: .
+    image: offline-vector-tile-api:latest
+    container_name: offline-vector-tile-api
+    ports:
+      - "8000:8000"
+    environment:
+      VT_DB_PATH: /data/tiles.db
+      VT_HOST: 0.0.0.0
+      VT_PORT: "8000"
+      VT_MIN_ZOOM: "0"
+      VT_MAX_ZOOM: "14"
+      VT_MAX_UPLOAD_BYTES: "52428800"
+      # Two independent uvicorn worker processes share the SQLite file so the
+      # cross-process append-revision race can be reproduced via the HTTP API.
+      VT_WORKERS: "2"
+    volumes:
+      - tile-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status == 200 else 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      # Both workers serialise first-touch schema setup behind a file lock
+      # (plus bounded retry); give the second worker room to finish.
+      start_period: 15s
+
+  # Ops/review helper, NOT started by `docker compose up`: it takes the same
+  # exclusive flock on /data/tiles.db.init.lock that the workers use during
+  # lifespan init. Use it to prove a persistent lock holder makes startup
+  # fail fast with SchemaUnavailable (bounded, non-blocking retries) instead
+  # of hanging in a blocking flock, and that startup succeeds after release.
+  # See README "3.3 持锁 / 解锁启动复核（Docker Compose）".
+  init-lock-holder:
+    build: .
+    image: offline-vector-tile-api:latest
+    container_name: vt-init-lock-holder
+    profiles: ["locktest"]
+    command: ["python", "scripts/hold_init_lock.py", "/data/tiles.db.init.lock"]
+    environment:
+      VT_DB_PATH: /data/tiles.db
+    volumes:
+      - tile-data:/data
+    restart: "no"
+
+volumes:
+  tile-data:

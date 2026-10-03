@@ -1,0 +1,49 @@
+{
+  "type": "FeatureCollection",
+  "name": "demo",
+  "features": [
+    {
+      "type": "Feature",
+      "id": 1001,
+      "properties": {"name": "Beijing", "kind": "capital"},
+      "geometry": {"type": "Point", "coordinates": [116.4074, 39.9042]}
+    },
+    {
+      "type": "Feature",
+      "id": 1002,
+      "properties": {"name": "Tokyo", "kind": "capital"},
+      "geometry": {"type": "Point", "coordinates": [139.6917, 35.6895]}
+    },
+    {
+      "type": "Feature",
+      "id": 2001,
+      "properties": {"name": "Yellow River approx", "scalerank": 5},
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [96.0, 35.0],
+          [103.8, 36.1],
+          [110.3, 40.0],
+          [118.7, 37.8]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": 3001,
+      "properties": {"name": "Demo rectangle"},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [100.0, 10.0],
+            [110.0, 10.0],
+            [110.0, 20.0],
+            [100.0, 20.0],
+            [100.0, 10.0]
+          ]
+        ]
+      }
+    }
+  ]
+}
