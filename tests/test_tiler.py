@@ -10,6 +10,7 @@ from shapely.geometry import (
 
 from app import tiler
 from app.config import BUFFER_UNITS, SIMPLIFY_UNITS
+from app.tiler import candidate_tiles_for_features, candidate_tiles_for_geometry
 
 
 def test_point_inside_tile():
@@ -214,3 +215,124 @@ def test_degenerate_quantized_polygon_does_not_crash():
     out = tiler.compile_feature_geometry(poly, 5, 16, 5)
     if out is not None:
         assert out.is_valid or out.geom_type.startswith("Multi")
+
+
+# ---------------------------------------------------------------------------
+# tile-diff candidate enumeration
+# ---------------------------------------------------------------------------
+
+
+def _brute_force_affected(geom, z):
+    """Every tile at zoom z whose buffered clip actually keeps the geometry."""
+    n = 1 << z
+    return {
+        (x, y)
+        for x in range(n)
+        for y in range(n)
+        if tiler.compile_feature_geometry(geom, z, x, y) is not None
+    }
+
+
+def test_candidates_cover_every_affected_tile():
+    geoms = [
+        Point(116.4074, 39.9042),
+        Point(0, 0),
+        Point(-180, 85.0511),
+        Point(180, -85),
+        LineString([(96, 35), (103.8, 36.1), (110.3, 40), (118.7, 37.8)]),
+        Polygon([(100, 10), (110, 10), (110, 20), (100, 20), (100, 10)]),
+        Polygon([(-50, -50), (50, -50), (50, 50), (-50, 50), (-50, -50)]),
+    ]
+    for z in (0, 1, 2, 3, 5):
+        for geom in geoms:
+            xmin, ymin, xmax, ymax = candidate_tiles_for_geometry(geom, z)
+            candidates = {
+                (x, y)
+                for x in range(xmin, xmax + 1)
+                for y in range(ymin, ymax + 1)
+            }
+            assert _brute_force_affected(geom, z) <= candidates
+
+
+def test_candidate_buffer_fraction_is_eight_pixels():
+    # 8 px on the 256 px screen grid = 1/32 of a tile.
+    assert tiler._BUFFER_TILE_FRACTION == 8 / 256
+
+
+def test_point_deep_inside_one_tile_has_one_candidate_at_z14():
+    # A local edit at z14 enumerates one tile, never the 2^28 world grid.
+    xmin, ymin, xmax, ymax = candidate_tiles_for_geometry(
+        Point(116.4074, 39.9042), 14
+    )
+    assert (xmax - xmin, ymax - ymin) == (0, 0)
+
+
+def test_point_near_corner_includes_buffered_neighbours():
+    # (0,0) is the corner shared by four z=1 tiles; the 1/32-tile buffer
+    # reaches into each of the four tiles.
+    assert candidate_tiles_for_geometry(Point(0, 0), 1) == (0, 0, 1, 1)
+
+
+def test_candidate_range_is_clamped_to_zoom_grid():
+    xmin, ymin, xmax, ymax = candidate_tiles_for_geometry(
+        Point(-180, 85.0511), 4
+    )
+    assert xmin == 0 and ymin == 0
+    xmin, ymin, xmax, ymax = candidate_tiles_for_geometry(Point(180, -85), 4)
+    assert xmax == 15 and ymax == 15
+
+
+def test_candidate_tiles_for_features_deduplicates():
+    feats = [
+        {"geometry": Point(0, 0), "properties": {}},
+        {"geometry": Point(0.0001, 0.0001), "properties": {}},
+        {"geometry": None, "properties": {}},
+    ]
+    coords = list(candidate_tiles_for_features(feats, 1))
+    assert len(coords) == len(set(coords))
+
+
+def test_candidates_for_features_without_or_duplicate_ids():
+    # Membership is decided by geometry, never by feature id: two id-less
+    # features and a duplicated-id feature must all contribute candidates.
+    feats = [
+        {"id": None, "geometry": Point(10, 50), "properties": {}},
+        {"id": 7, "geometry": Point(-40, -30), "properties": {}},
+        {"id": 7, "geometry": Point(139, 35), "properties": {}},
+    ]
+    coords = list(candidate_tiles_for_features(feats, 6))
+    assert len(coords) >= 3
+
+
+def test_feature_content_key_detects_geometry_and_property_changes():
+    from app.tiler import feature_content_key
+
+    base = {"id": 1, "geometry": Point(0, 0), "properties": {"a": 1}}
+    same = {"id": 1, "geometry": Point(0, 0), "properties": {"a": 1}}
+    moved = {"id": 1, "geometry": Point(1, 0), "properties": {"a": 1}}
+    re_propped = {"id": 1, "geometry": Point(0, 0), "properties": {"a": 2}}
+    re_id = {"id": 2, "geometry": Point(0, 0), "properties": {"a": 1}}
+    # Property key order must not matter (encoder sorts keys).
+    reordered = {"id": 1, "geometry": Point(0, 0), "properties": {"x": 0, "a": 1}}
+    base2 = {"id": 1, "geometry": Point(0, 0), "properties": {"a": 1, "x": 0}}
+
+    assert feature_content_key(base) == feature_content_key(same)
+    assert feature_content_key(base) != feature_content_key(moved)
+    assert feature_content_key(base) != feature_content_key(re_propped)
+    assert feature_content_key(base) != feature_content_key(re_id)
+    assert feature_content_key(reordered) == feature_content_key(base2)
+
+
+def test_build_tile_diff_index_counts_duplicate_keys():
+    from app.tiler import build_tile_diff_index, feature_content_key
+
+    f1 = {"id": None, "geometry": Point(0, 0), "properties": {}}
+    f2 = {"id": None, "geometry": Point(0, 0), "properties": {}}
+    index, counts = build_tile_diff_index(
+        [(feature_content_key(f1), f1), (feature_content_key(f2), f2)], 1
+    )
+    # (0,0) is the corner of four z=1 tiles; each gets both duplicate features.
+    for counter in counts.values():
+        assert sum(counter.values()) == 2
+        assert next(iter(counter.values())) == 2
+    assert all(len(v) == 2 for v in index.values())

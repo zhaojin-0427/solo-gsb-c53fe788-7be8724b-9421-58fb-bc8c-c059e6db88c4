@@ -12,7 +12,8 @@ Pipeline (applied per tile / per feature):
 from __future__ import annotations
 
 import hashlib
-from typing import Any
+import math
+from typing import Any, Iterator
 
 import mapbox_vector_tile
 import numpy as np
@@ -30,12 +31,28 @@ from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform as shp_transform
 
 from .config import BUFFER_UNITS, SIMPLIFY_UNITS, settings
-from .projection import make_lnglat_to_units_transformer
+from .projection import ORIGIN_SHIFT, lnglat_to_merc, make_lnglat_to_units_transformer
 
 EXTENT = settings.tile_extent
 # Integer coordinate window covered by the buffered clipping box.
 MIN_BUF = -BUFFER_UNITS
 MAX_BUF = EXTENT + BUFFER_UNITS
+
+# The buffered window as an axis-aligned polygon, oriented exactly as GEOS
+# emits an intersection result (screen-clockwise exterior in y-down space).
+# A hole-free area feature that fully covers it keeps this exact polygon all
+# the way through simplification / quantisation / cleaning, so it is returned
+# directly for those interior tiles -- byte-identical, but without rebuilding
+# the geometry at every pipeline stage.
+CLIP_BOX_GEOM = Polygon(
+    [
+        (MIN_BUF, MAX_BUF),
+        (MAX_BUF, MAX_BUF),
+        (MAX_BUF, MIN_BUF),
+        (MIN_BUF, MIN_BUF),
+        (MIN_BUF, MAX_BUF),
+    ]
+)
 
 
 def _geom_dimension(geom: BaseGeometry) -> int:
@@ -193,6 +210,9 @@ def compile_feature_geometry(
     transformer = make_lnglat_to_units_transformer(z, x, y, EXTENT)
     geom = shp_transform(transformer, geom_4326)
 
+    # Dimensional family of the *source* geometry.
+    dimension = _geom_dimension(geom_4326)
+
     # 1) Clip to the tile + 8 px (128 units) buffer.
     clip_box = Polygon(
         [
@@ -204,10 +224,23 @@ def compile_feature_geometry(
     )
     if not geom.intersects(clip_box):
         return None
+    # Fast path for a hole-free area feature that fully contains the buffered
+    # window (the many *interior* tiles of a large polygon at high zoom): the
+    # intersection is exactly the clip box, so we skip the costly polygon
+    # clipping.  The box is built in the same orientation ``intersection``
+    # emits (screen-clockwise exterior in y-down space), which keeps the
+    # encoded MVT bytes identical.  Polygons with holes or multipolygons keep
+    # the exact intersection path.
+    if (
+        dimension == 2
+        and geom.geom_type == "Polygon"
+        and not geom.interiors
+        and geom.covers(clip_box)
+    ):
+        # The buffered window survives the remaining stages unchanged.
+        return CLIP_BOX_GEOM
     geom = geom.intersection(clip_box)
 
-    # Determine dimensional family of the *source* geometry.
-    dimension = _geom_dimension(geom_4326)
     geom = _keep_dimension(geom, dimension)
     if geom is None or geom.is_empty:
         return None
@@ -344,3 +377,153 @@ def compile_tile(
 def tile_etag(data: bytes) -> str:
     """Strong validator for the exact MVT byte payload."""
     return '"' + hashlib.sha256(data).hexdigest() + '"'
+
+
+# ---------------------------------------------------------------------------
+# Incremental diff: candidate tile enumeration
+# ---------------------------------------------------------------------------
+
+
+# The clipping buffer measured in *fractions of a tile* at a given zoom.
+# BUFFER_UNITS / EXTENT == (8 px * 4096/256) / 4096 == 8/256 == 1/32.
+_BUFFER_TILE_FRACTION = BUFFER_UNITS / EXTENT
+
+
+def _project_to_merc(geom_4326: BaseGeometry) -> BaseGeometry:
+    """Project an EPSG:4326 geometry to Web Mercator metres (same path as the
+    tile pipeline, including the +/-85.05112878 degree latitude clip)."""
+
+    def project(xs, ys, zs=None):
+        mx, my = lnglat_to_merc(np.asarray(xs), np.asarray(ys))
+        return mx.tolist(), my.tolist()
+
+    return shp_transform(project, geom_4326)
+
+
+def candidate_tiles_for_geometry(
+    geom_4326: BaseGeometry, z: int
+) -> tuple[int, int, int, int]:
+    """Return the inclusive ``(xmin, ymin, xmax, ymax)`` XYZ tile range at zoom
+    ``z`` whose 8-pixel-buffered clip box can touch ``geom_4326``.
+
+    A feature only contributes geometry to a tile when the tile's buffered
+    window (the tile square plus 8 px = 1/32 of a tile on every side)
+    intersects the projected feature.  Working in *fractional tile* coordinates
+    at zoom ``z`` lets us turn that test into a bounds comparison, so a local
+    edit at z=14 enumerates a handful of tiles instead of all 2^28.
+
+    The range is an over-approximation: the final decision is always made on
+    the actual encoded MVT bytes (see ``tile-diff``), so candidates merely have
+    to be complete.  The Mercator Y mapping is identical to
+    :func:`projection.make_lnglat_to_units_transformer`, and vertices sitting
+    exactly on a buffered boundary are included.
+    """
+    merc = _project_to_merc(geom_4326)
+    minx, miny, maxx, maxy = merc.bounds
+
+    n = 1 << z
+    world = 2.0 * ORIGIN_SHIFT
+    size = world / n
+    b = _BUFFER_TILE_FRACTION
+    eps = 1e-9
+
+    # fx: fractional x column, grows eastward (fx = x + local_u/4096).
+    fx0 = (minx + ORIGIN_SHIFT) / size
+    fx1 = (maxx + ORIGIN_SHIFT) / size
+    # fy: fractional y row in *screen* space, grows southward.
+    fy0 = (ORIGIN_SHIFT - maxy) / size
+    fy1 = (ORIGIN_SHIFT - miny) / size
+
+    xmin = int(math.floor(fx0 - b + eps))
+    xmax = int(math.floor(fx1 + b - eps))
+    ymin = int(math.floor(fy0 - b + eps))
+    ymax = int(math.floor(fy1 + b - eps))
+
+    xmin = max(0, xmin)
+    ymin = max(0, ymin)
+    xmax = min(n - 1, xmax)
+    ymax = min(n - 1, ymax)
+    return xmin, ymin, xmax, ymax
+
+
+def build_tile_feature_index(
+    features: list[dict[str, Any]], z: int
+) -> dict[tuple[int, int], list[dict[str, Any]]]:
+    """Map every candidate tile at zoom ``z`` to the features that can reach it.
+
+    A feature is listed for a tile only when its projected bounds (with the
+    8 px buffer included) intersect that tile.  Membership is decided by
+    geometry alone, so features without an ID and features sharing an ID are
+    treated no differently.  The diff compiler feeds these per-tile subsets
+    through the *same* per-feature pipeline used by the tile endpoint, so it
+    never runs (or reprojects) far-away features for a tile; features absent
+    from a tile's list compile exactly to the same nothing the full pipeline
+    would have culled.
+    """
+    index: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for feature in features:
+        geom = feature["geometry"]
+        if geom is None or geom.is_empty:
+            continue
+        xmin, ymin, xmax, ymax = candidate_tiles_for_geometry(geom, z)
+        for x in range(xmin, xmax + 1):
+            for y in range(ymin, ymax + 1):
+                index.setdefault((x, y), []).append(feature)
+    return index
+
+
+def candidate_tiles_for_features(
+    features: list[dict[str, Any]], z: int
+) -> Iterator[tuple[int, int]]:
+    """Yield every candidate ``(x, y)`` tile at zoom ``z`` for the features."""
+    yield from build_tile_feature_index(features, z)
+
+
+def feature_content_key(feature: dict[str, Any]) -> str:
+    """Stable content key for one feature: id + sorted properties + geometry.
+
+    Two features with the same key are indistinguishable to the tile encoder
+    (the encoder sorts by id / content and normalises property keys), so a
+    tile whose covering features have the same multiset of keys on both
+    revisions provably compiles to the same bytes without being recompiled.
+    Geometry is hashed by WKB, which is canonical for a fixed Shapely/GEOS.
+    """
+    fid = feature.get("id")
+    props = _normalise_properties(feature.get("properties") or {})
+    geom = feature["geometry"]
+    geom_repr = geom.wkb_hex if geom is not None else "none"
+    payload = repr(fid) + "|" + repr(sorted(props.items())) + "|" + geom_repr
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def build_tile_diff_index(
+    keyed_features: list[tuple[str, dict[str, Any]]], z: int
+) -> tuple[
+    dict[tuple[int, int], list[dict[str, Any]]],
+    dict[tuple[int, int], dict[str, int]],
+]:
+    """Build per-tile feature subsets and feature-key multisets for a diff.
+
+    ``keyed_features`` pairs each feature with its (revision-local, precomputed)
+    :func:`feature_content_key`.  Returns:
+
+    * ``index``  -- candidate tile -> features whose buffered bounds touch it;
+    * ``counts`` -- candidate tile -> multiset (Counter) of feature keys.
+
+    The same tile having equal key multisets in both revisions means identical
+    covering features and therefore identical deterministic tile bytes.
+    """
+    index: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    counts: dict[tuple[int, int], dict[str, int]] = {}
+    for key, feature in keyed_features:
+        geom = feature["geometry"]
+        if geom is None or geom.is_empty:
+            continue
+        xmin, ymin, xmax, ymax = candidate_tiles_for_geometry(geom, z)
+        for x in range(xmin, xmax + 1):
+            for y in range(ymin, ymax + 1):
+                tile = (x, y)
+                index.setdefault(tile, []).append(feature)
+                counter = counts.setdefault(tile, {})
+                counter[key] = counter.get(key, 0) + 1
+    return index, counts

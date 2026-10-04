@@ -15,6 +15,7 @@
 | 不可变版本 | 每次发布写入一个新的 revision；历史 revision 永不被覆盖，可通过 `?revision=N` 固定取瓦片 |
 | 乐观并发控制 | 发布新版本必须携带 `expected_revision`，与当前 head 不一致时返回 **409 Conflict**；head 比较、revision 插入与 head 更新在单个跨进程有效的 `BEGIN IMMEDIATE` 事务内原子完成，多 worker 并发追加也只有一方成功 |
 | 瓦片编译 | `GET /datasets/{id}/tiles/{z}/{x}/{y}.mvt`，支持 **z = 0–14** 的 XYZ 瓦片 |
+| 离线增量清单 | `GET /datasets/{id}/tile-diff?from_revision&to_revision&z`：按**实际编码字节**列出两个不可变 revision 之间发生变化的瓦片（含两端 ETag），候选范围覆盖新增 / 删除 / 移动 / 属性变化与 **8 像素缓冲**邻瓦片；z=14 的局部更新只枚举触达瓦片，不枚举全球 |
 | 投影 | EPSG:4326 经纬度 → 球面 Web Mercator（R = 6378137），瓦片内坐标系为 4096 网格、Y 轴向下 |
 | 8 像素缓冲裁剪 | 点 / 线 / 面先裁剪到瓦片外扩 **8 px（128/4096 单位）**的边界，保证跨瓦片连续 |
 | 0.5 px 拓扑简化 | 以 **0.5 px（8/4096 单位）**容差做保拓扑 Douglas–Peucker 简化 |
@@ -32,8 +33,8 @@
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由：发布、版本、瓦片、错误处理
-│   ├── tiler.py         # 裁剪 / 简化 / 量化 / 稳定排序 / MVT 编码
+│   ├── main.py          # FastAPI 路由：发布、版本、瓦片、离线增量清单、错误处理
+│   ├── tiler.py         # 裁剪 / 简化 / 量化 / 稳定排序 / MVT 编码 / 候选瓦片枚举
 │   ├── projection.py    # EPSG:4326 -> Web Mercator -> 瓦片 4096 网格
 │   ├── geojson.py       # GeoJSON 校验与规范化
 │   ├── db.py            # SQLite 存储（datasets / revisions / tile_cache，非阻塞跨进程建库锁与事务）
@@ -41,7 +42,7 @@
 ├── data/sample.geojson  # 示例图层（点 / 线 / 面）
 ├── scripts/
 │   └── hold_init_lock.py # 持锁复核辅助：独占 <db>.init.lock（可定时释放）
-├── tests/               # pytest 测试（65 个用例，含非阻塞建库锁、初始化竞态与跨进程追加发布竞态回归）
+├── tests/               # pytest 测试（100 个用例，含 tile-diff 字节裁决、缓冲邻瓦片与 z14 局部更新）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -592,13 +593,173 @@ curl -i -H 'If-None-Match: "75dd0d37d05a70e4ed743cb72731f3bb8f3d0a513cfa58a1b473
 # HTTP/1.1 304 Not Modified（无响应体）
 ```
 
-### 4.6 错误示例
+### 4.6 离线瓦片增量清单（tile-diff）
+
+`GET /datasets/{id}/tile-diff` 读取 SQLite 中两个**不可变 revision** 的 GeoJSON，
+经与瓦片接口**完全相同**的投影、8 像素缓冲裁剪、简化、量化与 MVT 编译链路，
+按 **x、y 升序**返回在给定缩放级别上**实际编码字节发生变化**的瓦片，以及两端的
+ETag。清单里的 ETag 与钉版瓦片接口（`?revision=N`）返回的 ETag 逐字节一致，
+客户端可直接拿去做 `If-None-Match` / 增量下载。
+
+查询参数（均必填）：
+
+| 参数 | 说明 |
+| --- | --- |
+| `from_revision` | 旧修订号，正整数（`>= 1`），必须存在 |
+| `to_revision` | 新修订号，正整数（`>= 1`），必须存在；允许反方向比较 |
+| `z` | 缩放级别，`0–14` |
+
+**候选范围如何保证不漏报**：要素只可能影响它投影后（含 8 px = 1/32 瓦片外扩）
+覆盖到的瓦片。服务在该缩放级别的“分数瓦片坐标”里求每个要素的包围盒并集，
+因此：
+
+- **新增 / 删除 / 移动 / 属性变化**都会进入候选（属性变化不动几何，同样报出）；
+- 与瓦片边界相距 ≤ 8 px 的要素会因**缓冲**进入邻瓦片，邻瓦片同样在候选中；
+- 是否计入候选只取决于几何，**没有 ID 或 ID 重复的要素不会被漏报**；
+- 最终一律以**编译后的 MVT 字节**裁决：源 GeoJSON 不同但瓦片字节相同（例如
+  0.5 px 以内的抖动、被简化吃掉的顶点、同序重复点）**不报**；
+- 候选只是局部瓦片集合（点要素在 z=14 至多触达本体 + 4 个缓冲邻瓦片），
+  **z=14 的局部更新绝不会枚举全球 2²⁸ 个瓦片**。
+
+准备两个局部修订（rev 1 只有北京点；rev 2 改属性并新增东京点）：
+
+```bash
+R1='{"type":"FeatureCollection","features":[{"type":"Feature","id":1,"properties":{"name":"Beijing","kind":"capital"},"geometry":{"type":"Point","coordinates":[116.4074,39.9042]}}]}'
+R2='{"type":"FeatureCollection","features":[{"type":"Feature","id":1,"properties":{"name":"Peking","kind":"capital"},"geometry":{"type":"Point","coordinates":[116.4074,39.9042]}},{"type":"Feature","id":2,"properties":{"name":"Tokyo","kind":"capital"},"geometry":{"type":"Point","coordinates":[139.6917,35.6895]}}]}'
+DS=$(curl -s -X POST "http://localhost:8000/datasets?layer=demo" \
+  -H 'Content-Type: application/geo+json' -d "$R1" | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+curl -s -o /dev/null -X POST \
+  "http://localhost:8000/datasets/$DS/revisions?expected_revision=1" \
+  -H 'Content-Type: application/geo+json' -d "$R2"
+```
+
+请求清单（z=8，rev 1 → rev 2）：
+
+```bash
+curl -s "http://localhost:8000/datasets/$DS/tile-diff?from_revision=1&to_revision=2&z=8"
+```
+
+```json
+{
+  "dataset_id": "84806cfd2e6a46d5a4c2294f5a91bfa9",
+  "layer": "demo",
+  "z": 8,
+  "from_revision": 1,
+  "to_revision": 2,
+  "latest_revision": 2,
+  "changed_tiles": [
+    {
+      "z": 8,
+      "x": 210,
+      "y": 96,
+      "from_etag": "\"ef987139be510868174f6d6ccbd9c81bf0583227f62a478a0d2d971b9df1c9a7\"",
+      "to_etag": "\"0c223d4abbd047faf88799e05bc57943165a88bc311c03bed55071a6a4a182f8\""
+    },
+    {
+      "z": 8,
+      "x": 210,
+      "y": 97,
+      "from_etag": "\"2b411a550016e9525e3a7542e6b2b5e13ae93b69fac3c985ca0f3259174c89e7\"",
+      "to_etag": "\"79be2070a9569c602e2b2c1293c96e0b86974395446d546f941b980f51d8b831\""
+    },
+    {
+      "z": 8,
+      "x": 227,
+      "y": 100,
+      "from_etag": "\"2a792afe41c934edd71c07b2b290f8a698c16656b5251f22be4e7a10d7e2fa06\"",
+      "to_etag": "\"6ce539ded311fd2a5b36cac0134d93e6bfcc175d5919c16656b5251f22be4e7a10d7e2fa06\""
+    }
+  ]
+}
+```
+
+> 结果按 `x` 升序、`y` 升序排列。北京点在 z=8 因 8 px 缓冲同时落入
+> `(210,96)` 与 `(210,97)`（边界两侧），东京点新增触达 `(227,100)`，
+> 三处均报出。
+
+清单中的 ETag 与钉版瓦片完全一致（可直接比对）：
+
+```bash
+curl -s -D - -o /dev/null \
+  "http://localhost:8000/datasets/$DS/tiles/8/210/96.mvt?revision=1" | grep -i etag
+# etag: "ef987139be510868174f6d6ccbd9c81bf0583227f62a478a0d2d971b9df1c9a7"
+```
+
+相同修订（或两份修订编译出的瓦片完全相同）返回空清单，且不枚举任何瓦片：
+
+```bash
+curl -s "http://localhost:8000/datasets/$DS/tile-diff?from_revision=2&to_revision=2&z=8"
+```
+
+```json
+{"dataset_id":"84806cfd2e6a46d5a4c2294f5a91bfa9","layer":"demo","z":8,
+ "from_revision":2,"to_revision":2,"latest_revision":2,"changed_tiles":[]}
+```
+
+z=14 的局部属性更新只编译触达瓦片（实测毫秒级返回，下例仅 2 个瓦片）：
+
+```bash
+curl -s "http://localhost:8000/datasets/$DS/tile-diff?from_revision=1&to_revision=2&z=14"
+```
+
+```json
+{
+  "dataset_id": "84806cfd2e6a46d5a4c2294f5a91bfa9",
+  "layer": "demo",
+  "z": 14,
+  "from_revision": 1,
+  "to_revision": 2,
+  "latest_revision": 2,
+  "changed_tiles": [
+    {
+      "z": 14,
+      "x": 13489,
+      "y": 6208,
+      "from_etag": "\"453240ce86ef07868e205146b20fefa7a0360bbf1d525316ff8af8d696bbe82a\"",
+      "to_etag": "\"95c63b6730d48cb166dc1f92fcfc05d4731f2bd5594774366a37663ad305f69e\""
+    },
+    {
+      "z": 14,
+      "x": 14549,
+      "y": 6451,
+      "from_etag": "\"2a792afe41c934edd71c07b2b290f8a698c16656b5251f22be4e7a10d7e2fa06\"",
+      "to_etag": "\"c45ae316e0fe24ae359fde4924034c2c034170fa9a399065cc94d4bda186fb9c\""
+    }
+  ]
+}
+```
+
+> `(13489,6208)` 是北京点所在瓦片（rev1→rev2 仅属性变化，ETag 随之变化）；
+> `(14549,6451)` 是东京点新增瓦片，其 `from_etag` 是该图层的“空瓦片”字节
+> （不含任何要素的图层编码，故各空瓦片 ETag 相同）。注意点要素在 z=14 只
+> 触达本体（本例恰好不跨 8 px 边界），全程只枚举了这 2 个瓦片。
+
+错误情形：
+
+```bash
+# 数据集不存在 / 修订不存在 -> 404
+curl -i "http://localhost:8000/datasets/nope/tile-diff?from_revision=1&to_revision=2&z=0"
+# HTTP/1.1 404 Not Found  {"error":"dataset not found", ...}
+curl -i "http://localhost:8000/datasets/$DS/tile-diff?from_revision=1&to_revision=9&z=0"
+# HTTP/1.1 404 Not Found  {"error":"revision 9 does not exist", ...}
+
+# 非法修订号 / 非法 z / 缺参数 -> 400
+curl -i "http://localhost:8000/datasets/$DS/tile-diff?from_revision=x&to_revision=2&z=0"
+# HTTP/1.1 400 Bad Request  {"error":"query parameter 'from_revision' must be an integer"}
+curl -i "http://localhost:8000/datasets/$DS/tile-diff?from_revision=1&to_revision=2&z=15"
+# HTTP/1.1 400 Bad Request  {"error":"zoom z must be between 0 and 14"}
+curl -i "http://localhost:8000/datasets/$DS/tile-diff?from_revision=1&to_revision=2"
+# HTTP/1.1 400 Bad Request  {"error":"missing required query parameter 'z'"}
+```
+
+### 4.7 错误示例
 
 | 场景 | 状态码 |
 | --- | --- |
 | GeoJSON 不是 FeatureCollection / 空集合 / JSON 解析失败 / 坐标越界 / 自交多边形 / null 几何 | `400` |
 | 瓦片 `z` 超出 0–14、`x/y` 为负或超出该级别范围、非整数 | `400` |
-| 数据集或 `revision` 不存在 | `404` |
+| tile-diff 缺少 `from_revision` / `to_revision` / `z`、非整数或修订号非正、`z` 超出 0–14 | `400` |
+| 数据集或 `revision` 不存在（含 tile-diff 的任一端修订） | `404` |
 | 发布版本时 `expected_revision` 与 head 不一致 | `409` |
 | 上传体积超过限制（默认 50 MB） | `413` |
 
@@ -643,6 +804,11 @@ curl -i -X POST http://localhost:8000/datasets \
 ETag 会持久化在 SQLite `tile_cache` 表中，因此重复请求乃至服务进程重启后，
 同一 `(dataset, revision, z, x, y)` 的字节和 ETag 始终一致。
 
+**增量清单复用同一管线**：`tile-diff` 不做任何几何或属性级的“语义比对”，而是
+对候选瓦片两端各跑一次上述同一管线、以编码字节（即 SHA-256 ETag）是否相同
+裁决，所以清单与钉版瓦片天然一致；候选瓦片则由“要素投影包围盒 ∩ 瓦片 8 px
+缓冲窗”在分数瓦片坐标中求出（见 [§4.6](#46-离线瓦片增量清单tile-diff)）。
+
 > 说明：MVT 要素 ID 按协议仅支持非负 uint64 整数；字符串 ID 的要素仍会被
 > 确定性排序，但其 ID 不写入 protobuf（属性中若需要可自行保留）。
 
@@ -657,6 +823,7 @@ ETag 会持久化在 SQLite `tile_cache` 表中，因此重复请求乃至服务
 | `GET` | `/datasets` | 列出全部数据集 |
 | `GET` | `/datasets/{id}` | 数据集元数据与全部 revision |
 | `GET/HEAD` | `/datasets/{id}/tiles/{z}/{x}/{y}.mvt` | 获取瓦片（支持 `?revision=N` 与 `If-None-Match`） |
+| `GET` | `/datasets/{id}/tile-diff` | 两个 revision 间实际字节变化的瓦片清单（`from_revision`、`to_revision`、`z=0–14`，按 x、y 升序，ETag 与钉版瓦片一致） |
 | `GET` | `/healthz` | 健康检查 |
 | `GET` | `/docs` | Swagger UI 交互文档 |
 
