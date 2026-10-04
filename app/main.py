@@ -7,6 +7,7 @@ POST /datasets/{dataset_id}/revisions               append revision (409 on conf
 GET  /datasets                                      list datasets
 GET  /datasets/{dataset_id}                         dataset metadata + revisions
 GET  /datasets/{dataset_id}/tiles/{z}/{x}/{y}.mvt   vector tile (ETag / 304)
+GET  /datasets/{dataset_id}/tile-diff               incremental changed-tile manifest
 GET  /healthz                                       liveness
 """
 from __future__ import annotations
@@ -25,6 +26,7 @@ from fastapi.responses import JSONResponse
 from shapely.geometry import shape as shapely_shape
 
 from . import db
+from . import tilediff
 from .config import settings
 from .geojson import GeoJSONValidationError, features_to_canonical_json, parse_geojson
 from .tiler import compile_tile, tile_etag
@@ -345,6 +347,50 @@ def _if_none_match_matches(header: str | None, etag: str) -> bool:
     return False
 
 
+def _get_tile_entry(
+    conn,
+    dataset_id: str,
+    layer_name: str,
+    revision: int,
+    z: int,
+    x: int,
+    y: int,
+) -> tuple[str, bytes]:
+    """Return ``(etag, body)`` for one tile, byte-identical to the tile API.
+
+    Lookup order is the in-process LRU, then the SQLite ``tile_cache`` row
+    written by previous requests, then deterministic compilation.  Both the
+    tile endpoint and the tile-diff endpoint resolve every tile through this
+    single path, so the ``from_etag`` / ``to_etag`` values in a diff manifest
+    are guaranteed to equal the ETags returned by the pinned tile endpoint.
+    """
+    cache_key = (dataset_id, revision, z, x, y)
+
+    # 1) in-process cache
+    entry = _tile_lru.get(cache_key)
+    if entry is None:
+        # 2) SQLite tile cache
+        row = db.get_cached_tile(conn, *cache_key)
+        if row is not None:
+            entry = (row["etag"], bytes(row["body"]))
+            _tile_lru.put(cache_key, entry)
+
+    if entry is None:
+        # 3) compile deterministically; identical inputs -> identical bytes.
+        with _compile_lock:
+            entry = _tile_lru.get(cache_key)
+            if entry is None:
+                features = _load_revision_features(conn, dataset_id, revision)
+                body = compile_tile({layer_name: features}, z, x, y)
+                etag = tile_etag(body)
+                entry = (etag, body)
+                db.store_cached_tile(
+                    conn, dataset_id, revision, z, x, y, etag, body
+                )
+                _tile_lru.put(cache_key, entry)
+    return entry
+
+
 @app.api_route(
     "/datasets/{dataset_id}/tiles/{z}/{x}/{y}.mvt",
     methods=["GET", "HEAD"],
@@ -379,32 +425,9 @@ async def get_tile(
                 latest_revision=head_revision,
             )
 
-        cache_key = (dataset_id, chosen_revision, z_i, x_i, y_i)
-
-        # 1) in-process cache
-        entry = _tile_lru.get(cache_key)
-        if entry is None:
-            # 2) SQLite tile cache
-            row = db.get_cached_tile(conn, *cache_key)
-            if row is not None:
-                entry = (row["etag"], bytes(row["body"]))
-                _tile_lru.put(cache_key, entry)
-
-        if entry is None:
-            # 3) compile deterministically; identical inputs -> identical bytes.
-            with _compile_lock:
-                entry = _tile_lru.get(cache_key)
-                if entry is None:
-                    features = _load_revision_features(conn, dataset_id, chosen_revision)
-                    body = compile_tile({layer_name: features}, z_i, x_i, y_i)
-                    etag = tile_etag(body)
-                    entry = (etag, body)
-                    db.store_cached_tile(
-                        conn, dataset_id, chosen_revision, z_i, x_i, y_i, etag, body
-                    )
-                    _tile_lru.put(cache_key, entry)
-
-    etag, body = entry
+        etag, body = _get_tile_entry(
+            conn, dataset_id, layer_name, chosen_revision, z_i, x_i, y_i
+        )
 
     if _if_none_match_matches(request.headers.get("if-none-match"), etag):
         return Response(
@@ -432,6 +455,131 @@ async def get_tile(
                 else "public, no-cache"
             ),
         },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Incremental tile diff
+# ---------------------------------------------------------------------------
+
+
+def _parse_revision_param(raw: str | None, name: str) -> int:
+    """Parse ``from_revision`` / ``to_revision``; raise ValueError for 400s."""
+    if raw is None:
+        raise ValueError(f"missing required query parameter '{name}'")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"'{name}' must be an integer")
+    if value < 1:
+        raise ValueError(f"'{name}' must reference an existing revision (>=1)")
+    return value
+
+
+def _parse_diff_zoom(raw: str | None) -> int:
+    """Parse the diff zoom parameter (integer within the compiled range)."""
+    if raw is None:
+        raise ValueError("missing required query parameter 'z'")
+    try:
+        z = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError("'z' must be an integer")
+    if not (settings.min_zoom <= z <= settings.max_zoom):
+        raise ValueError(
+            f"zoom z must be between {settings.min_zoom} and {settings.max_zoom}"
+        )
+    return z
+
+
+@app.get("/datasets/{dataset_id}/tile-diff", tags=["tiles"])
+def get_tile_diff(dataset_id: str, request: Request) -> JSONResponse:
+    """List tiles whose encoded MVT bytes change between two revisions.
+
+    Query parameters
+    ----------------
+    from_revision, to_revision : positive revision numbers (both must exist)
+    z                          : zoom level, 0-14
+
+    The candidate range is derived from the mercator bounds of every feature
+    of both revisions, expanded by the same 8 px buffer used when clipping,
+    so added / removed / moved / attribute-changed features and buffer-only
+    neighbours are all covered (ID-less and duplicate-ID features included).
+    Each candidate is then resolved through the exact projection / clip /
+    simplify / quantise / MVT pipeline and adjudicated by *encoded bytes*:
+    tiles that stay byte-identical even when the source GeoJSON differs are
+    not reported.  ``from_etag`` / ``to_etag`` are the very ETags returned by
+    the pinned tile endpoint.  Results are sorted by ``x`` then ``y``.
+    """
+    params = request.query_params
+    try:
+        from_revision = _parse_revision_param(
+            params.get("from_revision"), "from_revision"
+        )
+        to_revision = _parse_revision_param(
+            params.get("to_revision"), "to_revision"
+        )
+        z = _parse_diff_zoom(params.get("z"))
+    except ValueError as exc:
+        return _error(400, str(exc))
+
+    with db.connection() as conn:
+        dataset = db.get_dataset(conn, dataset_id)
+        if dataset is None:
+            return _error(404, "dataset not found", dataset_id=dataset_id)
+
+        missing = [
+            rev
+            for rev in (from_revision, to_revision)
+            if db.get_revision(conn, dataset_id, rev) is None
+        ]
+        if missing:
+            rev = sorted(set(missing))[0]
+            return _error(
+                404,
+                f"revision {rev} does not exist",
+                dataset_id=dataset_id,
+                latest_revision=dataset["latest_revision"],
+            )
+
+        # Same revision: the immutable blob and deterministic pipeline make
+        # the byte diff empty by construction -- skip enumeration entirely.
+        if from_revision == to_revision:
+            changed: list[dict[str, Any]] = []
+        else:
+            layer_name = dataset["layer"]
+            features_from = _load_revision_features(conn, dataset_id, from_revision)
+            features_to = _load_revision_features(conn, dataset_id, to_revision)
+            candidates = tilediff.candidate_tiles(features_from, features_to, z)
+
+            changed = []
+            for x, y in candidates:
+                etag_from, body_from = _get_tile_entry(
+                    conn, dataset_id, layer_name, from_revision, z, x, y
+                )
+                etag_to, body_to = _get_tile_entry(
+                    conn, dataset_id, layer_name, to_revision, z, x, y
+                )
+                # Encoded bytes are the final arbiter: a different source
+                # document that compiles to the same tile is no change at all.
+                if body_from != body_to:
+                    changed.append(
+                        {
+                            "z": z,
+                            "x": x,
+                            "y": y,
+                            "from_etag": etag_from,
+                            "to_etag": etag_to,
+                        }
+                    )
+
+    return JSONResponse(
+        content={
+            "dataset_id": dataset_id,
+            "z": z,
+            "from_revision": from_revision,
+            "to_revision": to_revision,
+            "changed_tiles": changed,
+        }
     )
 
 
